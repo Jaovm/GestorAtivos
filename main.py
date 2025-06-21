@@ -5,6 +5,14 @@ import numpy as np
 import datetime
 from io import BytesIO
 import matplotlib.pyplot as plt
+import subprocess
+import sys
+
+try:
+    from pyportfolioopt import EfficientFrontier
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "PyPortfolioOpt"])
+    from pyportfolioopt import EfficientFrontier
 from pyportfolioopt import EfficientFrontier, risk_models, expected_returns, HRPOpt, CLA
 from pyportfolioopt import objective_functions
 

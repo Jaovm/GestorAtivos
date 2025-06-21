@@ -3,18 +3,8 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import datetime
-from io import BytesIO
 import matplotlib.pyplot as plt
-import subprocess
-import sys
-
-try:
-    from pyportfolioopt import EfficientFrontier
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "PyPortfolioOpt"])
-    from pyportfolioopt import EfficientFrontier
-from pyportfolioopt import EfficientFrontier, risk_models, expected_returns, HRPOpt, CLA
-from pyportfolioopt import objective_functions
+import riskfolio.Portfolio as pf
 
 # ========================== PARTE 1: MAPEAMENTO DE ATIVOS ==========================
 
@@ -33,7 +23,6 @@ ATIVOS_ETF_INT = ["IVV", "QQQM", "QUAL", "XLRE"]
 
 ALL_TICKERS = ATIVOS_ACOES + ATIVOS_FIIS + ATIVOS_TESOURO + ATIVOS_DEBENTURE + ATIVOS_ETF_INT
 
-# Classes para classificação automática
 def classificar_ativo(ticker):
     ticker = ticker.upper()
     if ticker in ATIVOS_ACOES:
@@ -53,16 +42,15 @@ def mapear_ativos(df):
 
 # ========================== PARTE 2: FUNÇÕES DE DADOS ==========================
 
-def get_historical_prices(tickers, start, end, moeda="BRL"):
-    # yfinance suporta tickers internacionais, mas tickers brasileiros precisam de '.SA'
+def get_historical_prices(tickers, start, end):
     data = {}
     for ticker in tickers:
-        if classificar_ativo(ticker) == "Ação" or classificar_ativo(ticker) == "FII":
+        if classificar_ativo(ticker) in ["Ação", "FII"]:
             yf_ticker = f"{ticker}.SA"
         elif classificar_ativo(ticker) == "ETF Internacional":
-            yf_ticker = ticker  # Ex: IVV (EUA)
+            yf_ticker = ticker
         else:
-            continue  # Tesouro/Debênture: simula como renda fixa (aproximação)
+            continue
         try:
             df = yf.download(yf_ticker, start=start, end=end)["Adj Close"]
             data[ticker] = df
@@ -72,19 +60,17 @@ def get_historical_prices(tickers, start, end, moeda="BRL"):
     return prices
 
 def get_simulated_fixed_income(tickers, start, end):
-    # Simula Tesouro e Debênture com retornos fixos aproximados (anualizados)
     drange = pd.date_range(start, end, freq='B')
     data = {}
     for ticker in tickers:
         if "LFT" in ticker:
-            rate = 0.1  # CDI
+            rate = 0.1
         elif "LTN" in ticker:
-            rate = 0.11  # Pré
+            rate = 0.11
         elif "DEB" in ticker or "VINLAND" in ticker:
             rate = 0.115
         else:
             rate = 0.1
-        # Monta uma curva acumulada (juros compostos)
         n = len(drange)
         vals = np.cumprod(np.ones(n) * (1 + rate/252))
         data[ticker] = pd.Series(vals, index=drange)
@@ -97,35 +83,33 @@ def unir_bases(prices_rv, prices_rf):
 
 # ========================== PARTE 3: OTIMIZAÇÃO DE CARTEIRA ==========================
 
-def otimizar_markowitz(prices, pesos_iniciais=None):
-    mu = expected_returns.mean_historical_return(prices)
-    S = risk_models.sample_cov(prices)
-    ef = EfficientFrontier(mu, S)
-    if pesos_iniciais is not None:
-        ef.set_weights(pesos_iniciais)
-    ef.add_objective(objective_functions.L2_reg, gamma=0.01)
-    weights = ef.max_sharpe()
-    cleaned = ef.clean_weights()
-    return cleaned, ef
+def otimizar_markowitz(prices):
+    returns = prices.pct_change().dropna()
+    port = pf.Portfolio(returns=returns)
+    port.assets_stats(method_mu='hist', method_cov='hist')
+    w = port.optimization(model='Classic', rm='MV', obj='Sharpe', rf=0, l=0)
+    return w
 
 def otimizar_risk_parity(prices):
-    S = risk_models.sample_cov(prices)
-    w = 1 / np.diag(S)
-    w = w / w.sum()
-    return dict(zip(S.columns, w))
+    returns = prices.pct_change().dropna()
+    port = pf.Portfolio(returns=returns)
+    port.assets_stats(method_mu='hist', method_cov='hist')
+    w = port.optimization(model='Classic', rm='MV', obj='MinRisk', rf=0, l=0, par=True)
+    return w
 
 def otimizar_hrp(prices):
-    hrp = HRPOpt(prices.pct_change().dropna())
-    weights = hrp.optimize()
-    return weights
+    returns = prices.pct_change().dropna()
+    port = pf.Portfolio(returns=returns)
+    port.assets_stats(method_mu='hist', method_cov='hist')
+    w = port.optimization(model='HRP', rm='MV', obj='Sharpe', rf=0, l=0)
+    return w
 
 # ========================== PARTE 4: ESTRATÉGIAS DE REBALANCEAMENTO ==========================
 
 def buy_and_hold(pesos_atual):
-    return pesos_atual.copy()  # Mantém igual
+    return pesos_atual.copy()
 
 def cppi(valor_inicial, valor_minimo, m, rf_rate, prices):
-    # CPPI: calcula alocação ideal para o portfolio
     cushion = (valor_inicial - valor_minimo) / valor_inicial
     risky_weight = m * cushion
     risky_weight = min(max(risky_weight, 0), 1)
@@ -147,7 +131,6 @@ def constant_mix(pesos_alvo):
 # ========================== PARTE 5: SUGESTÃO DE APORTE ==========================
 
 def sugerir_aporte(df, aporte, pesos_alvo):
-    # Calcula o quanto colocar em cada ativo para caminhar para o ideal (sem venda, só compra)
     total_atual = df["Valor"].sum()
     total_final = total_atual + aporte
     valor_ideal_final = {k: v * total_final for k, v in pesos_alvo.items()}
@@ -157,7 +140,6 @@ def sugerir_aporte(df, aporte, pesos_alvo):
         atual = valores_atuais.get(ticker, 0)
         aporte_necessario = max(0, ideal_final - atual)
         valores_aporte[ticker] = aporte_necessario
-    # Normaliza para não ultrapassar o aporte disponível
     soma = sum(valores_aporte.values())
     if soma > 0:
         for k in valores_aporte:
@@ -183,7 +165,6 @@ with st.expander("ℹ️ O que este app faz? Clique para saber mais."):
     **Aviso:** Os retornos de Tesouro e Debênture são simulados. Ativos internacionais NÃO consideram automaticamente o dólar; é recomendado atenção ao risco cambial.
     """)
 
-# ======= Aba de Explicações =======
 with st.sidebar.expander("📚 Entenda os Modelos"):
     st.markdown("""
     **Modelos de Otimização:**
@@ -199,7 +180,6 @@ with st.sidebar.expander("📚 Entenda os Modelos"):
     **Atenção:** ETFs como IVV, QQQM são cotados em dólar - há risco cambial.
     """)
 
-# ======= Entrada da Carteira =======
 st.header("1️⃣ Informe sua carteira atual")
 st.markdown("Digite o ticker e o valor investido em cada ativo. Você pode adicionar linhas, remover ou editar.")
 
@@ -216,18 +196,9 @@ df_carteira = st.data_editor(
     use_container_width=True,
     key="edicao_carteira"
 )
-# Classifica cada linha
 df_carteira["Classe"] = mapear_ativos(df_carteira)
-
-# Checa tickers inválidos
-tickers_validos = ALL_TICKERS
-if not all([t in tickers_validos or classificar_ativo(t) != "Desconhecido" for t in df_carteira["Ticker"]]):
-    st.warning("⚠️ Alguns tickers não são reconhecidos. Verifique a lista de ativos suportados no início do app.")
-
-# Calcula os pesos atuais
 total = df_carteira["Valor"].sum()
 df_carteira["Peso Atual (%)"] = df_carteira["Valor"] / total * 100
-
 st.write(df_carteira)
 
 # ====================== OTIMIZAÇÃO ======================
@@ -240,7 +211,6 @@ anos = int(periodo.split()[0])
 end = datetime.date.today()
 start = end - datetime.timedelta(days=anos*365)
 
-# Baixar cotação histórica
 tickers_rv = [t for t in df_carteira["Ticker"] if classificar_ativo(t) in ["Ação", "FII", "ETF Internacional"]]
 tickers_rf = [t for t in df_carteira["Ticker"] if classificar_ativo(t) in ["Tesouro Direto", "Debênture"]]
 
@@ -248,19 +218,19 @@ prices_rv = get_historical_prices(tickers_rv, start, end)
 prices_rf = get_simulated_fixed_income(tickers_rf, start, end)
 prices = unir_bases(prices_rv, prices_rf)
 
-# Otimização
 st.subheader("Alocação Ideal Sugerida")
 if modelo_otimizacao == "Markowitz (Fronteira Eficiente)":
-    pesos_otim, ef = otimizar_markowitz(prices)
+    pesos_otim = otimizar_markowitz(prices)
 elif modelo_otimizacao == "Risk Parity":
     pesos_otim = otimizar_risk_parity(prices)
 elif modelo_otimizacao == "Hierarchical Risk Parity (HRP)":
     pesos_otim = otimizar_hrp(prices)
 else:
-    pesos_otim = dict(zip(prices.columns, [1/len(prices.columns)]*len(prices.columns)))
+    pesos_otim = pd.Series([1/len(prices.columns)]*len(prices.columns), index=prices.columns)
 
 # Ajusta ordem dos ativos para tabela
-pesos_ideais = pd.Series(pesos_otim).reindex(df_carteira["Ticker"]).fillna(0)
+pesos_otim = pesos_otim.dropna()
+pesos_ideais = pesos_otim.reindex(df_carteira["Ticker"]).fillna(0)
 df_carteira["Peso Ideal (%)"] = pesos_ideais.values * 100
 df_carteira["Desvio (%)"] = df_carteira["Peso Atual (%)"] - df_carteira["Peso Ideal (%)"]
 
@@ -288,7 +258,6 @@ elif modelo_reb == "Constant Mix":
 else:
     pesos_rebal = buy_and_hold(pesos_ideais)
 
-# Normaliza para somar 1
 soma_rebal = sum(pesos_rebal.values())
 final_pesos = {k: v/soma_rebal for k, v in pesos_rebal.items()}
 
@@ -307,7 +276,6 @@ if novo_aporte > 0:
 # ====================== VISUALIZAÇÕES ======================
 st.header("5️⃣ Painel de Resultados e Visualização")
 
-# Gráfico de pizza: atual vs ideal
 col1, col2 = st.columns(2)
 with col1:
     st.subheader("Alocação Atual")
@@ -320,7 +288,6 @@ with col2:
     ax2.pie([final_pesos.get(t,0)*100 for t in df_carteira["Ticker"]], labels=df_carteira["Ticker"], autopct='%1.1f%%')
     st.pyplot(fig2)
 
-# Tabela: atual, alvo, desvio
 st.subheader("Tabela de Alocação")
 df_out = df_carteira.copy()
 df_out["Peso Rebalanceado (%)"] = [final_pesos.get(t,0)*100 for t in df_out["Ticker"]]
@@ -328,13 +295,14 @@ st.dataframe(df_out[["Ticker", "Classe", "Peso Atual (%)", "Peso Ideal (%)", "Pe
 
 # Fronteira Eficiente (apenas Markowitz)
 if modelo_otimizacao == "Markowitz (Fronteira Eficiente)":
-    st.subheader("Fronteira Eficiente de Markowitz")
+    st.subheader("Fronteira Eficiente com Riskfolio")
     try:
-        cla = CLA(expected_returns.mean_historical_return(prices), risk_models.sample_cov(prices))
-        cla.max_sharpe()
-        frontier_returns, frontier_risks, _ = cla.efficient_frontier()
+        returns = prices.pct_change().dropna()
+        port = pf.Portfolio(returns=returns)
+        port.assets_stats(method_mu='hist', method_cov='hist')
+        frontier = port.efficient_frontier(model='Classic', rm='MV', points=50, rf=0, hist=True)
         fig, ax = plt.subplots()
-        ax.plot(frontier_risks, frontier_returns, 'b--')
+        ax.plot(frontier['Risk'], frontier['Return'], 'b--')
         ax.set_xlabel("Risco (Desvio Padrão)")
         ax.set_ylabel("Retorno Esperado")
         st.pyplot(fig)
@@ -346,7 +314,6 @@ st.header("6️⃣ Exportar Alocação Final")
 csv = df_out[["Ticker", "Classe", "Peso Atual (%)", "Peso Ideal (%)", "Peso Rebalanceado (%)", "Desvio (%)"]].to_csv(index=False)
 st.download_button("Baixar tabela em CSV", data=csv, file_name="nova_alocacao_carteira.csv", mime="text/csv")
 
-# ====================== FIM DO APP ======================
 st.info("""
 Este app é apenas para fins educacionais e não constitui recomendação de investimento. Sempre consulte um profissional qualificado antes de tomar decisões financeiras.
 """)

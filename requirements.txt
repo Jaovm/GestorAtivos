@@ -9,4 +9,4 @@ beautifulsoup4
 PyPortfolioOpt
 scikit-learn
 cvxpy
-riskfolio
+riskfolio-lib
